@@ -26,7 +26,7 @@ def run_routing_script_with_search():
     user_layer = user_layers[0]
     fat_layer = fat_layers[0]
 
-    # 2. Daftar userPaniki
+    # 2. Daftar userPaniki (Sudah diperbaiki agar kebal terhadap error QVariant)
     daftar_user = []
     user_dict = {} 
     
@@ -34,7 +34,8 @@ def run_routing_script_with_search():
         if not f.hasGeometry():
             continue
         
-        nama_user = f['userPaniki'] if 'userPaniki' in f.fields().names() else str(f.id())
+        raw_name = f['userPaniki'] if 'userPaniki' in f.fields().names() else f.id()
+        nama_user = str(raw_name) if raw_name else str(f.id())
         
         if nama_user not in daftar_user:
             daftar_user.append(nama_user)
@@ -90,7 +91,7 @@ def run_routing_script_with_search():
     user_geom_wgs.transform(transform_to_wgs84)
     user_pt_wgs = user_geom_wgs.asPoint()
 
-    # 7. Cache data FAT, CEK IDLESPLITTER, dan NAMA OLT
+    # 7. Cache data FAT
     fat_data = []
     for f in fat_layer.getFeatures():
         if not f.hasGeometry():
@@ -109,15 +110,18 @@ def run_routing_script_with_search():
         fat_pt_wgs = fat_geom_wgs.asPoint()
         
         idFAT = f['idFAT'] if 'idFAT' in f.fields().names() else str(f.id())
-        
-        # --- PERBAIKAN: MENGAMBIL NAMA OLT DARI LAYER FAT ---
         nama_olt = str(f['idOLT']) if 'idOLT' in f.fields().names() else "-"
+        
+        # --- PERBAIKAN: FORMAT KOORDINAT FAT ---
+        # Menyatukan Latitude dan Longitude menjadi teks (6 angka di belakang koma)
+        koordinat_teks = f"{fat_pt_wgs.y():.6f}, {fat_pt_wgs.x():.6f}"
         
         fat_data.append({
             'name': idFAT, 
             'point_wgs': fat_pt_wgs,
             'idle': idle_val,
-            'olt': nama_olt  # Simpan ke cache memori
+            'olt': nama_olt,
+            'koordinat': koordinat_teks 
         })
 
     # 8. Layer Output
@@ -125,12 +129,13 @@ def run_routing_script_with_search():
     line_layer = QgsVectorLayer(f"LineString?crs={user_layer.crs().authid()}", layer_name, "memory")
     provider = line_layer.dataProvider()
     
-    # --- PERBAIKAN: TAMBAH FIELD NAMA OLT ---
+    # --- PERBAIKAN: TAMBAHKAN KOLOM KOORDINAT FAT ---
     provider.addAttributes([
         QgsField("userPaniki", QVariant.String),
+        QgsField("idOLT", QVariant.String),
         QgsField("idFAT", QVariant.String),
         QgsField("usedSPLT", QVariant.Int),
-        QgsField("idOLT", QVariant.String), # Kolom baru untuk OLT
+        QgsField("koordinatFAT", QVariant.String),
         QgsField("jarak_jalan_m", QVariant.Double)
     ])
     line_layer.updateFields()
@@ -170,9 +175,15 @@ def run_routing_script_with_search():
                     new_feat = QgsFeature()
                     new_feat.setGeometry(route_geom)
                     
-                    # --- PERBAIKAN: MASUKKAN NILAI OLT KE TABEL ATRIBUT ---
-                    # Urutan di sini harus persis sama dengan urutan di langkah 8
-                    new_feat.setAttributes([selected_user, fat['name'], fat['idle'], fat['olt'], round(route_dist, 2)])
+                    # --- PERBAIKAN: MASUKKAN DATA KOORDINAT KE ATRIBUT ---
+                    new_feat.setAttributes([
+                        selected_user, 
+                        fat['name'], 
+                        fat['idle'], 
+                        fat['olt'], 
+                        fat['koordinat'], 
+                        round(route_dist, 2)
+                    ])
                     new_features.append(new_feat)
                 else:
                     print(f"GAGAL (Rute jalan terlalu jauh: {round(route_dist, 2)}m)")
@@ -184,7 +195,7 @@ def run_routing_script_with_search():
         
         time.sleep(0.2) 
 
- # 10. Tampilkan Hasil
+    # 10. Tampilkan Hasil
     if new_features:
         provider.addFeatures(new_features)
         
@@ -203,17 +214,13 @@ def run_routing_script_with_search():
         # --- FITUR BARU: AUTO ZOOM KE HASIL RUTE ---
         iface.mapCanvas().setExtent(line_layer.extent())
         iface.mapCanvas().refresh()
-        # ------------------------------------------
         
         QMessageBox.information(parent, "Sukses", f"Ditemukan {len(new_features)} jalur rute valid yang port-nya tersedia.")
     else:
         # --- FITUR BARU: AUTO PAN & ZOOM KE TITIK USER JIKA TIDAK ADA RUTE ---
-        # Arahkan kamera tepat ke koordinat user
         iface.mapCanvas().setCenter(target_user_feat.geometry().asPoint())
-        # Set skala zoom 1:2000 agar detail jalan terlihat
         iface.mapCanvas().zoomScale(2000) 
         iface.mapCanvas().refresh()
-        # ---------------------------------------------------------------------
         
         QMessageBox.information(parent, "Selesai", f"Tidak ada rute <= 500 meter dengan port tersedia yang ditemukan.")
     
