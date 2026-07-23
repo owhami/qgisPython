@@ -13,14 +13,14 @@ from PyQt5.QtCore import QVariant
 
 def run_routing_script_with_search():
     # 1. Nama layer
-    user_layer_name = 'PANIKI_BPP'
-    fat_layer_name = 'FAT_BPP'
+    user_layer_name = 'tbUsrPan'
+    fat_layer_name = 'tbFAT'
 
     user_layers = QgsProject.instance().mapLayersByName(user_layer_name)
     fat_layers = QgsProject.instance().mapLayersByName(fat_layer_name)
 
     if not user_layers or not fat_layers:
-        print("Error: Layer PANIKI_BPP atau FAT_BPP tidak ditemukan!")
+        print("Error: Layer tbUsrPan atau tbFAT tidak ditemukan!")
         return
 
     user_layer = user_layers[0]
@@ -41,7 +41,7 @@ def run_routing_script_with_search():
             user_dict[nama_user] = f
 
     if not daftar_user:
-        print("Tidak ada data user valid di layer PANIKI_BPP.")
+        print("Tidak ada data user valid di layer tbUsrPan.")
         return
 
     # 3. Pop-up Search User
@@ -184,7 +184,7 @@ def run_routing_script_with_search():
         
         time.sleep(0.2) 
 
-    # 10. Tampilkan Hasil
+ # 10. Tampilkan Hasil
     if new_features:
         provider.addFeatures(new_features)
         
@@ -199,8 +199,22 @@ def run_routing_script_with_search():
         line_layer.setRenderer(renderer)
         
         QgsProject.instance().addMapLayer(line_layer)
+        
+        # --- FITUR BARU: AUTO ZOOM KE HASIL RUTE ---
+        iface.mapCanvas().setExtent(line_layer.extent())
+        iface.mapCanvas().refresh()
+        # ------------------------------------------
+        
         QMessageBox.information(parent, "Sukses", f"Ditemukan {len(new_features)} jalur rute valid yang port-nya tersedia.")
     else:
+        # --- FITUR BARU: AUTO PAN & ZOOM KE TITIK USER JIKA TIDAK ADA RUTE ---
+        # Arahkan kamera tepat ke koordinat user
+        iface.mapCanvas().setCenter(target_user_feat.geometry().asPoint())
+        # Set skala zoom 1:2000 agar detail jalan terlihat
+        iface.mapCanvas().zoomScale(2000) 
+        iface.mapCanvas().refresh()
+        # ---------------------------------------------------------------------
+        
         QMessageBox.information(parent, "Selesai", f"Tidak ada rute <= 500 meter dengan port tersedia yang ditemukan.")
     
     print("--- SELESAI ---")
