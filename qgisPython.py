@@ -143,7 +143,7 @@ def run_routing_script_with_search():
 
     new_features = []
 
-    # 9. Request API OSRM
+    # 9. Request API OSRM (FOSSGIS routed-foot -- sama dengan mesin "foot" di openstreetmap.org)
     for fat in fat_data:
         straight_dist = d_wgs.measureLine(user_pt_wgs, fat['point_wgs'])
         
@@ -154,9 +154,12 @@ def run_routing_script_with_search():
 
         lon1, lat1 = user_pt_wgs.x(), user_pt_wgs.y()
         lon2, lat2 = fat['point_wgs'].x(), fat['point_wgs'].y()
-        
-        url_forward = f"http://router.project-osrm.org/route/v1/foot/{lon1},{lat1};{lon2},{lat2}?overview=full&geometries=geojson"
-        url_backward = f"http://router.project-osrm.org/route/v1/foot/{lon2},{lat2};{lon1},{lat1}?overview=full&geometries=geojson"
+
+        # PERUBAHAN: pakai server FOSSGIS routed-foot (sama seperti mode "foot" di openstreetmap.org)
+        # Catatan: meski profilnya "foot", segmen URL tetap "driving" -- pemilihan
+        # profil di server ini dilakukan lewat prefix "routed-foot", bukan lewat /v1/<mode>/
+        url_forward = f"https://routing.openstreetmap.de/routed-foot/route/v1/driving/{lon1},{lat1};{lon2},{lat2}?overview=full&geometries=geojson"
+        url_backward = f"https://routing.openstreetmap.de/routed-foot/route/v1/driving/{lon2},{lat2};{lon1},{lat1}?overview=full&geometries=geojson"
         
         try:
             # A. Cek Rute Maju
@@ -173,7 +176,8 @@ def run_routing_script_with_search():
             
             # B. Pengecekan Melawan Arus
             if route_dist > 500 or (straight_dist <= 150 and route_dist > straight_dist * 1.5):
-                time.sleep(0.1) 
+                # PERUBAHAN: jeda dinaikkan ke 1 detik agar sesuai kebijakan rate-limit server (maks 1 request/detik)
+                time.sleep(1.0)
                 req_bw = urllib.request.Request(url_backward, headers={'User-Agent': 'QGIS-PyQGIS-Script'})
                 res_bw = urllib.request.urlopen(req_bw)
                 data_bw = json.loads(res_bw.read().decode('utf-8'))
@@ -231,7 +235,8 @@ def run_routing_script_with_search():
             else:
                  print(f"ERROR JARINGAN API")
         
-        time.sleep(0.2) 
+        # PERUBAHAN: jeda dinaikkan ke 1 detik agar sesuai kebijakan rate-limit server (maks 1 request/detik)
+        time.sleep(1.0)
 
     # 10. Tampilkan Hasil
     if new_features:
