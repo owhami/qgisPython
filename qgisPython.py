@@ -171,23 +171,33 @@ def run_routing_script_with_search():
                 route_dist = data['routes'][0]['distance']
                 route_coords = data['routes'][0]['geometry']['coordinates']
             
-            # B. Jika rute mutar jauh (>500m), Trik Cek Arah Mundur (Melawan Arus)
-            if route_dist > 500:
-                time.sleep(0.1) # Jeda aman
+            # B. Pengecekan Melawan Arus
+            if route_dist > 500 or (straight_dist <= 150 and route_dist > straight_dist * 1.5):
+                time.sleep(0.1) 
                 req_bw = urllib.request.Request(url_backward, headers={'User-Agent': 'QGIS-PyQGIS-Script'})
                 res_bw = urllib.request.urlopen(req_bw)
                 data_bw = json.loads(res_bw.read().decode('utf-8'))
                 
                 if data_bw['code'] == 'Ok':
                     dist_bw = data_bw['routes'][0]['distance']
-                    # Jika jarak melawan arus ternyata pendek, gunakan jarak ini!
                     if dist_bw < route_dist: 
                         route_dist = dist_bw
                         route_coords = data_bw['routes'][0]['geometry']['coordinates']
                         print("[MELAWAN ARUS] ", end="")
 
-            # C. Eksekusi Gambar Garis OSRM
-            if route_dist <= 500 and route_coords:
+            # C. LOGIKA BARU: Deteksi OSRM Error/Mutar Jauh
+            # Jika rute API > 1.5x jarak lurus, DAN jarak aslinya di bawah 150m (Bisa tarik drop core)
+            if straight_dist <= 150 and route_dist > (straight_dist * 1.5):
+                print(f"KOREKSI! OSRM mutar jauh ({round(route_dist, 2)}m). Paksa tarik lurus: {round(straight_dist, 2)}m")
+                route_geom = QgsGeometry.fromPolylineXY([user_pt_local, fat['point_local']])
+                
+                new_feat = QgsFeature(line_layer.fields())
+                new_feat.setGeometry(route_geom)
+                new_feat.setAttributes([str(selected_user), str(fat['name']), int(fat['idle']), str(fat['olt']), str(fat['koordinat']), float(round(straight_dist, 2))])
+                new_features.append(new_feat)
+                
+            # D. Jika Rute API Normal dan Masuk Akal
+            elif route_dist <= 500 and route_coords:
                 print(f"BERHASIL! Rute Jalan = {round(route_dist, 2)}m")
                 points = [QgsPointXY(pt[0], pt[1]) for pt in route_coords]
                 route_geom = QgsGeometry.fromPolylineXY(points)
@@ -198,9 +208,9 @@ def run_routing_script_with_search():
                 new_feat.setAttributes([str(selected_user), str(fat['name']), int(fat['idle']), str(fat['olt']), str(fat['koordinat']), float(round(route_dist, 2))])
                 new_features.append(new_feat)
                 
-            # D. Fallback: Jika di server mutar jauh, tapi aslinya berseberangan (<= 150m), tarik garis lurus
+            # E. Fallback Terakhir
             elif straight_dist <= 150:
-                print(f"KOREKSI! OSRM memutar jauh. Paksa tarik lurus: {round(straight_dist, 2)}m")
+                print(f"KOREKSI! OSRM Gagal >500m. Paksa tarik lurus: {round(straight_dist, 2)}m")
                 route_geom = QgsGeometry.fromPolylineXY([user_pt_local, fat['point_local']])
                 
                 new_feat = QgsFeature(line_layer.fields())
@@ -211,7 +221,6 @@ def run_routing_script_with_search():
                 print(f"GAGAL (Rute jalan terlalu jauh: {round(route_dist, 2)}m)")
                 
         except Exception as e:
-            # Jika API internet putus, tapi jarak lurus sangat dekat, tetap buat garis lurus
             if straight_dist <= 150:
                  print(f"KOREKSI API ERROR! Paksa tarik lurus: {round(straight_dist, 2)}m")
                  route_geom = QgsGeometry.fromPolylineXY([user_pt_local, fat['point_local']])
@@ -231,7 +240,6 @@ def run_routing_script_with_search():
         line_layer.commitChanges()
         line_layer.updateExtents()
         
-        # Style Garis Merah 0.8 mm
         symbol_layer = QgsSimpleLineSymbolLayer.create({
             'line_width': '0.8',          
             'line_color': '255,0,0,255'   
@@ -256,5 +264,4 @@ def run_routing_script_with_search():
     
     print("--- SELESAI ---")
 
-# Jalankan fungsi
 run_routing_script_with_search()
