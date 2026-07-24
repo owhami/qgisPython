@@ -13,14 +13,14 @@ from PyQt5.QtCore import QVariant
 
 def run_routing_script_with_search():
     # 1. Nama layer
-    user_layer_name = 'tbUsrPan'
+    user_layer_name = 'tbUser'
     fat_layer_name = 'tbFAT'
 
     user_layers = QgsProject.instance().mapLayersByName(user_layer_name)
     fat_layers = QgsProject.instance().mapLayersByName(fat_layer_name)
 
     if not user_layers or not fat_layers:
-        print("Error: Layer tbUsrPan atau tbFAT tidak ditemukan!")
+        print("Error: Layer tbUser atau tbFAT tidak ditemukan!")
         return
 
     user_layer = user_layers[0]
@@ -42,7 +42,7 @@ def run_routing_script_with_search():
             user_dict[nama_user] = f
 
     if not daftar_user:
-        print("Tidak ada data user valid di layer tbUsrPan.")
+        print("Tidak ada data user valid di layer tbUser.")
         return
 
     # 3. Pop-up Search User
