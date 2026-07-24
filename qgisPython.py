@@ -143,7 +143,43 @@ def run_routing_script_with_search():
 
     new_features = []
 
-    # 9. Request API OSRM (FOSSGIS routed-foot -- sama dengan mesin "foot" di openstreetmap.org)
+    # Helper: satu kali percobaan request ke server FOSSGIS untuk profil tertentu
+    # ('foot' atau 'car'). Mengembalikan (distance, coords) kalau valid, atau
+    # (None, None) kalau gagal/error/tidak valid. Semua error ditangani di
+    # dalam sini supaya percobaan profil lain tetap bisa dilanjutkan.
+    def query_osrm(profile, lon_a, lat_a, lon_b, lat_b, straight_dist):
+        url = f"https://routing.openstreetmap.de/routed-{profile}/route/v1/driving/{lon_a},{lat_a};{lon_b},{lat_b}?overview=full&geometries=geojson"
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': 'QGIS-PyQGIS-Script'})
+            res = urllib.request.urlopen(req)
+            data = json.loads(res.read().decode('utf-8'))
+        except Exception as e:
+            print(f"[{profile} ERROR: {repr(e)}] ", end="")
+            return None, None
+
+        if data.get('code') != 'Ok':
+            print(f"[{profile} code={data.get('code')}] ", end="")
+            return None, None
+
+        dist = data['routes'][0]['distance']
+        coords = data['routes'][0]['geometry']['coordinates']
+
+        # PERBAIKAN BUG: OSRM kadang membalas code='Ok' dengan distance mendekati 0
+        # meski titik asal & tujuan jelas berjauhan -- indikasi start & end
+        # ke-snap ke node/ruas yang sama. Anggap tidak valid.
+        if dist < 5 and straight_dist > 10:
+            print(f"[{profile} snap ke titik sama, distance={dist}m -> diabaikan] ", end="")
+            return None, None
+
+        if dist > 500:
+            print(f"[{profile}={round(dist,2)}m, >500m] ", end="")
+            return None, None
+
+        return dist, coords
+
+    # 9. Request API OSRM (FOSSGIS) -- coba profil 'foot' dulu (prioritas karena
+    # ini rute pejalan kaki), kalau gagal total baru coba profil 'car' sebagai
+    # cadangan supaya tetap mengikuti jaringan jalan yang ada, bukan tarik lurus.
     for fat in fat_data:
         straight_dist = d_wgs.measureLine(user_pt_wgs, fat['point_wgs'])
         
@@ -155,54 +191,37 @@ def run_routing_script_with_search():
         lon1, lat1 = user_pt_wgs.x(), user_pt_wgs.y()
         lon2, lat2 = fat['point_wgs'].x(), fat['point_wgs'].y()
 
-        # PERUBAHAN: pakai server FOSSGIS routed-foot (sama seperti mode "foot" di openstreetmap.org)
-        # Catatan: meski profilnya "foot", segmen URL tetap "driving" -- pemilihan
-        # profil di server ini dilakukan lewat prefix "routed-foot", bukan lewat /v1/<mode>/
-        url_forward = f"https://routing.openstreetmap.de/routed-foot/route/v1/driving/{lon1},{lat1};{lon2},{lat2}?overview=full&geometries=geojson"
-        url_backward = f"https://routing.openstreetmap.de/routed-foot/route/v1/driving/{lon2},{lat2};{lon1},{lat1}?overview=full&geometries=geojson"
-        
-        try:
-            # A. Cek Rute Maju
-            req = urllib.request.Request(url_forward, headers={'User-Agent': 'QGIS-PyQGIS-Script'})
-            res = urllib.request.urlopen(req)
-            data = json.loads(res.read().decode('utf-8'))
-            
-            route_dist = float('inf')
-            route_coords = None
-            
-            if data['code'] == 'Ok':
-                route_dist = data['routes'][0]['distance']
-                route_coords = data['routes'][0]['geometry']['coordinates']
-            
-            # B. Pengecekan Melawan Arus
-            if route_dist > 500 or (straight_dist <= 150 and route_dist > straight_dist * 1.5):
-                # PERUBAHAN: jeda dinaikkan ke 1 detik agar sesuai kebijakan rate-limit server (maks 1 request/detik)
-                time.sleep(1.0)
-                req_bw = urllib.request.Request(url_backward, headers={'User-Agent': 'QGIS-PyQGIS-Script'})
-                res_bw = urllib.request.urlopen(req_bw)
-                data_bw = json.loads(res_bw.read().decode('utf-8'))
-                
-                if data_bw['code'] == 'Ok':
-                    dist_bw = data_bw['routes'][0]['distance']
-                    if dist_bw < route_dist: 
-                        route_dist = dist_bw
-                        route_coords = data_bw['routes'][0]['geometry']['coordinates']
-                        print("[MELAWAN ARUS] ", end="")
+        route_dist = None
+        route_coords = None
+        profile_used = None
 
-            # C. LOGIKA BARU: Deteksi OSRM Error/Mutar Jauh
-            # Jika rute API > 1.5x jarak lurus, DAN jarak aslinya di bawah 150m (Bisa tarik drop core)
-            if straight_dist <= 150 and route_dist > (straight_dist * 1.5):
-                print(f"KOREKSI! OSRM mutar jauh ({round(route_dist, 2)}m). Paksa tarik lurus: {round(straight_dist, 2)}m")
-                route_geom = QgsGeometry.fromPolylineXY([user_pt_local, fat['point_local']])
-                
-                new_feat = QgsFeature(line_layer.fields())
-                new_feat.setGeometry(route_geom)
-                new_feat.setAttributes([str(selected_user), str(fat['name']), int(fat['idle']), str(fat['olt']), str(fat['koordinat']), float(round(straight_dist, 2))])
-                new_features.append(new_feat)
-                
-            # D. Jika Rute API Normal dan Masuk Akal
-            elif route_dist <= 500 and route_coords:
-                print(f"BERHASIL! Rute Jalan = {round(route_dist, 2)}m")
+        try:
+            # A. Profil FOOT -- maju, lalu mundur kalau maju gagal
+            route_dist, route_coords = query_osrm('foot', lon1, lat1, lon2, lat2, straight_dist)
+            if route_coords:
+                profile_used = 'foot'
+            else:
+                time.sleep(1.0)
+                d_bw, c_bw = query_osrm('foot', lon2, lat2, lon1, lat1, straight_dist)
+                if c_bw:
+                    route_dist, route_coords, profile_used = d_bw, c_bw, 'foot (mundur)'
+
+            # B. Profil CAR sebagai cadangan -- HANYA kalau foot gagal total.
+            # Ini menirukan hasil TomTom yang mengikuti jaringan jalan mobil.
+            if route_coords is None:
+                time.sleep(1.0)
+                d_car, c_car = query_osrm('car', lon1, lat1, lon2, lat2, straight_dist)
+                if c_car:
+                    route_dist, route_coords, profile_used = d_car, c_car, 'car (cadangan)'
+                else:
+                    time.sleep(1.0)
+                    d_car_bw, c_car_bw = query_osrm('car', lon2, lat2, lon1, lat1, straight_dist)
+                    if c_car_bw:
+                        route_dist, route_coords, profile_used = d_car_bw, c_car_bw, 'car (cadangan, mundur)'
+
+            # C. Kalau salah satu profil berhasil, PAKAI APA ADANYA
+            if route_coords:
+                print(f"BERHASIL! [{profile_used}] Rute Jalan = {round(route_dist, 2)}m")
                 points = [QgsPointXY(pt[0], pt[1]) for pt in route_coords]
                 route_geom = QgsGeometry.fromPolylineXY(points)
                 route_geom.transform(transform_to_local)
@@ -212,9 +231,10 @@ def run_routing_script_with_search():
                 new_feat.setAttributes([str(selected_user), str(fat['name']), int(fat['idle']), str(fat['olt']), str(fat['koordinat']), float(round(route_dist, 2))])
                 new_features.append(new_feat)
                 
-            # E. Fallback Terakhir
+            # D. Fallback terakhir -- HANYA kalau foot MAUPUN car sama-sama
+            # tidak menghasilkan rute sama sekali
             elif straight_dist <= 150:
-                print(f"KOREKSI! OSRM Gagal >500m. Paksa tarik lurus: {round(straight_dist, 2)}m")
+                print(f"KOREKSI! Tidak ada rute jalan (foot maupun car). Paksa tarik lurus: {round(straight_dist, 2)}m")
                 route_geom = QgsGeometry.fromPolylineXY([user_pt_local, fat['point_local']])
                 
                 new_feat = QgsFeature(line_layer.fields())
@@ -222,9 +242,10 @@ def run_routing_script_with_search():
                 new_feat.setAttributes([str(selected_user), str(fat['name']), int(fat['idle']), str(fat['olt']), str(fat['koordinat']), float(round(straight_dist, 2))])
                 new_features.append(new_feat)
             else:
-                print(f"GAGAL (Rute jalan terlalu jauh: {round(route_dist, 2)}m)")
-                
+                print(f"GAGAL (tidak ada rute jalan yang valid dalam radius 500m)")
+
         except Exception as e:
+            print(f"[ERROR TAK TERDUGA: {repr(e)}] ", end="")
             if straight_dist <= 150:
                  print(f"KOREKSI API ERROR! Paksa tarik lurus: {round(straight_dist, 2)}m")
                  route_geom = QgsGeometry.fromPolylineXY([user_pt_local, fat['point_local']])
@@ -235,7 +256,7 @@ def run_routing_script_with_search():
             else:
                  print(f"ERROR JARINGAN API")
         
-        # PERUBAHAN: jeda dinaikkan ke 1 detik agar sesuai kebijakan rate-limit server (maks 1 request/detik)
+        # Jeda 1 detik agar sesuai kebijakan rate-limit server (maks 1 request/detik)
         time.sleep(1.0)
 
     # 10. Tampilkan Hasil
