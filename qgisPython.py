@@ -10,16 +10,17 @@ from PyQt5.QtWidgets import QApplication, QInputDialog, QMessageBox
 from PyQt5.QtCore import QVariant
 
 def run_routing_script_with_search():
-    # ================== KONFIGURASI JARINGAN TIANG ==================
-    # GANTI nama layer tiang ini sesuai nama layer asli di proyekmu
-    pole_layer_name = 'tbPole'
-    RADIUS_TIANG_M = 500  
-    MAX_SPAN_M = 80       
-    MAX_DROP_M = 500      
+        
 
     # 1. Nama layer
     user_layer_name = 'tbUser'
     fat_layer_name = 'tbFAT'
+    pole_layer_name = 'tbPole'
+
+    # ================== KONFIGURASI JARINGAN TIANG ==================
+    RADIUS_TIANG_M = 500  
+    MAX_SPAN_M = 80       
+    MAX_DROP_M = 500  
 
     user_layers = QgsProject.instance().mapLayersByName(user_layer_name)
     fat_layers = QgsProject.instance().mapLayersByName(fat_layer_name)
