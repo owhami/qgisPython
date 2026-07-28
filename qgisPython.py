@@ -1,6 +1,4 @@
-import json
-import urllib.request
-import time
+import heapq
 from qgis.core import (
     QgsProject, QgsFeature, QgsGeometry, QgsVectorLayer,
     QgsDistanceArea, QgsField, QgsCoordinateTransform, 
@@ -12,19 +10,31 @@ from PyQt5.QtWidgets import QApplication, QInputDialog, QMessageBox
 from PyQt5.QtCore import QVariant
 
 def run_routing_script_with_search():
+    # ================== KONFIGURASI JARINGAN TIANG ==================
+    pole_layer_name = 'tbPole'
+    MAX_SPAN_M = 80         
+    MAX_DROP_M = 500    
+    RADIUS_TIANG_M = 500 
+
     # 1. Nama layer
     user_layer_name = 'tbUser'
     fat_layer_name = 'tbFAT'
 
     user_layers = QgsProject.instance().mapLayersByName(user_layer_name)
     fat_layers = QgsProject.instance().mapLayersByName(fat_layer_name)
+    pole_layers = QgsProject.instance().mapLayersByName(pole_layer_name)
 
     if not user_layers or not fat_layers:
         print("Error: Layer tbUser atau tbFAT tidak ditemukan!")
         return
 
+    if not pole_layers:
+        print(f"Error: Layer tiang '{pole_layer_name}' tidak ditemukan! Ganti nama di variabel pole_layer_name kalau nama layer berbeda.")
+        return
+
     user_layer = user_layers[0]
     fat_layer = fat_layers[0]
+    pole_layer = pole_layers[0]
 
     # 2. Daftar userPaniki
     daftar_user = []
@@ -126,8 +136,93 @@ def run_routing_script_with_search():
             'koordinat': koordinat_teks
         })
 
+    # 7b. Cache data Tiang (hanya yang dalam RADIUS_TIANG_M dari user, biar graf tidak kebesaran)
+    print(f"Memuat titik tiang dalam radius {RADIUS_TIANG_M}m dari user...")
+    pole_points = []
+    for i, f in enumerate(pole_layer.getFeatures()):
+        if not f.hasGeometry() or f.geometry().isNull():
+            continue
+
+        p_local = f.geometry().asPoint()
+        p_geom_wgs = QgsGeometry(f.geometry())
+        p_geom_wgs.transform(transform_to_wgs84)
+        p_wgs = p_geom_wgs.asPoint()
+
+        dist_from_user = d_wgs.measureLine(user_pt_wgs, p_wgs)
+        if dist_from_user > RADIUS_TIANG_M:
+            continue
+
+        id_tiang = f['idTiang'] if 'idTiang' in f.fields().names() else f.id()
+
+        pole_points.append({
+            'id': i,
+            'label': str(id_tiang),
+            'point_wgs': p_wgs,
+            'point_local': p_local
+        })
+
+    print(f"-> {len(pole_points)} tiang dimuat.")
+
+    if not pole_points:
+        print(f"Tidak ada tiang dalam radius {RADIUS_TIANG_M}m dari user. Tidak bisa membuat rute.")
+        return
+
+    # 7c. Bangun graf: dua tiang dianggap tersambung (1 bentangan kabel) kalau
+    print(f"Membangun graf jaringan tiang (span maks {MAX_SPAN_M}m)...")
+    graph = {p['id']: [] for p in pole_points}
+    n = len(pole_points)
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = d_wgs.measureLine(pole_points[i]['point_wgs'], pole_points[j]['point_wgs'])
+            if dist <= MAX_SPAN_M:
+                graph[pole_points[i]['id']].append((pole_points[j]['id'], dist))
+                graph[pole_points[j]['id']].append((pole_points[i]['id'], dist))
+    print("-> Graf selesai dibangun.")
+
+    pole_by_id = {p['id']: p for p in pole_points}
+
+    def dijkstra(start_id, end_id):
+        """Cari jalur terpendek antar dua tiang di graf.
+        Return (jarak_total, [list_id_tiang_berurutan]) atau (None, None) kalau tidak tersambung."""
+        if start_id == end_id:
+            return 0.0, [start_id]
+        dist = {start_id: 0.0}
+        prev = {}
+        visited = set()
+        pq = [(0.0, start_id)]
+        while pq:
+            d, node = heapq.heappop(pq)
+            if node in visited:
+                continue
+            visited.add(node)
+            if node == end_id:
+                path = [node]
+                while path[-1] != start_id:
+                    path.append(prev[path[-1]])
+                path.reverse()
+                return d, path
+            for neighbor, weight in graph.get(node, []):
+                nd = d + weight
+                if neighbor not in dist or nd < dist[neighbor]:
+                    dist[neighbor] = nd
+                    prev[neighbor] = node
+                    heapq.heappush(pq, (nd, neighbor))
+        return None, None
+
+    def nearest_pole(point_wgs, max_dist):
+        """Cari tiang terdekat dari suatu titik, dalam batas max_dist (kabel drop).
+        Return (dict_tiang, jarak) atau (None, None) kalau tidak ada tiang dalam jangkauan."""
+        best = None
+        best_dist = None
+        for p in pole_points:
+            dist = d_wgs.measureLine(point_wgs, p['point_wgs'])
+            if dist <= max_dist and (best_dist is None or dist < best_dist):
+                best = p
+                best_dist = dist
+        return best, best_dist
+
     # 8. Layer Output
-    layer_name = f"Rute_{selected_user}_OSRM"
+    layer_name = f"Rute_{selected_user}_Tiang"
     line_layer = QgsVectorLayer(f"LineString?crs={user_layer.crs().authid()}", layer_name, "memory")
     provider = line_layer.dataProvider()
     
@@ -137,54 +232,16 @@ def run_routing_script_with_search():
         QgsField("usedSPLT", QVariant.Int),
         QgsField("idOLT", QVariant.String),
         QgsField("koordinatFAT", QVariant.String),
-        QgsField("jarak_jalan_m", QVariant.Double)
+        QgsField("jarak_jalan_m", QVariant.Double),
+        QgsField("jml_tiang", QVariant.Int)
     ])
     line_layer.updateFields()
 
     new_features = []
 
-    # Helper: satu kali percobaan request ke server FOSSGIS untuk profil tertentu
-    # ('foot' atau 'car'). Mengembalikan (distance, coords) kalau valid, atau
-    # (None, None) kalau gagal/error/tidak valid. Semua error ditangani di
-    # dalam sini supaya percobaan profil lain tetap bisa dilanjutkan.
-    def query_osrm(profile, lon_a, lat_a, lon_b, lat_b, straight_dist):
-        url = f"https://routing.openstreetmap.de/routed-{profile}/route/v1/driving/{lon_a},{lat_a};{lon_b},{lat_b}?overview=full&geometries=geojson"
-        try:
-            req = urllib.request.Request(url, headers={'User-Agent': 'QGIS-PyQGIS-Script'})
-            res = urllib.request.urlopen(req)
-            data = json.loads(res.read().decode('utf-8'))
-        except Exception as e:
-            print(f"[{profile} ERROR: {repr(e)}] ", end="")
-            return None, None
-
-        if data.get('code') != 'Ok':
-            print(f"[{profile} code={data.get('code')}] ", end="")
-            return None, None
-
-        dist = data['routes'][0]['distance']
-        coords = data['routes'][0]['geometry']['coordinates']
-
-        # OSRM kadang membalas code='Ok' dengan distance mendekati 0 meski
-        # titik asal & tujuan jelas berjauhan -- indikasi start & end
-        # ke-snap ke node/ruas yang sama. Anggap tidak valid.
-        if dist < 5 and straight_dist > 10:
-            print(f"[{profile} snap ke titik sama, distance={dist}m -> diabaikan] ", end="")
-            return None, None
-
-        if dist > 500:
-            print(f"[{profile}={round(dist,2)}m, >500m] ", end="")
-            return None, None
-
-        return dist, coords
-
-    # 9. Request API OSRM (FOSSGIS) -- coba profil 'foot' DAN 'car', lalu pilih
-    # yang hasilnya paling PENDEK & valid di antara keduanya (bukan cuma
-    # berhenti begitu salah satu berhasil). Ini penting karena kadang profil
-    # 'foot' "berhasil" tapi dengan rute memutar jauh -- padahal jalan yang
-    # sama mungkin ramah untuk profil 'car' dan lebih pendek/masuk akal.
-    # TIDAK ADA fallback tarik garis lurus sama sekali -- kalau kedua profil
-    # gagal menemukan rute nyata, FAT tersebut dilewati saja, supaya tidak
-    # pernah muncul garis yang menyeberangi sungai/area yang tidak valid.
+    # 9. Routing lewat jaringan tiang (bukan lewat OSRM lagi) -- kabel drop
+    # (user->tiang & tiang->FAT) dihitung garis lurus (sesuai praktik FTTH
+    # nyata), jalur antar tiang dicari lewat Dijkstra di graf yang sudah dibangun.
     for fat in fat_data:
         straight_dist = d_wgs.measureLine(user_pt_wgs, fat['point_wgs'])
         
@@ -193,51 +250,41 @@ def run_routing_script_with_search():
 
         print(f"Menguji FAT: {fat['name']} [Sisa Port: {fat['idle']}] (Jarak Lurus: {round(straight_dist, 2)}m) ... ", end="")
 
-        lon1, lat1 = user_pt_wgs.x(), user_pt_wgs.y()
-        lon2, lat2 = fat['point_wgs'].x(), fat['point_wgs'].y()
+        pole_user, drop_user = nearest_pole(user_pt_wgs, MAX_DROP_M)
+        pole_fat, drop_fat = nearest_pole(fat['point_wgs'], MAX_DROP_M)
 
-        kandidat = []  # list of (distance, coords, label) -- kumpulkan semua hasil valid
+        if pole_user is None or pole_fat is None:
+            print(f"GAGAL (tidak ada tiang dalam jangkauan drop {MAX_DROP_M}m dari user/FAT)")
+            continue
 
-        # A. Coba FOOT maju dan CAR maju -- keduanya, bukan salah satu saja
-        d_foot, c_foot = query_osrm('foot', lon1, lat1, lon2, lat2, straight_dist)
-        if c_foot:
-            kandidat.append((d_foot, c_foot, 'foot'))
+        path_dist, path_ids = dijkstra(pole_user['id'], pole_fat['id'])
 
-        time.sleep(1.0)
-        d_car, c_car = query_osrm('car', lon1, lat1, lon2, lat2, straight_dist)
-        if c_car:
-            kandidat.append((d_car, c_car, 'car'))
+        if path_dist is None:
+            print("GAGAL (tiang user & FAT tidak tersambung di jaringan tiang -- cek span/data tiang)")
+            continue
 
-        # B. Kalau DUA-DUANYA gagal maju, baru coba arah mundur untuk keduanya
-        if not kandidat:
-            time.sleep(1.0)
-            d_bw, c_bw = query_osrm('foot', lon2, lat2, lon1, lat1, straight_dist)
-            if c_bw:
-                kandidat.append((d_bw, c_bw, 'foot (mundur)'))
+        total_dist = drop_user + path_dist + drop_fat
+        if total_dist > 500:
+            print(f"GAGAL (total rute via tiang {round(total_dist, 2)}m > 500m)")
+            continue
 
-            time.sleep(1.0)
-            d_car_bw, c_car_bw = query_osrm('car', lon2, lat2, lon1, lat1, straight_dist)
-            if c_car_bw:
-                kandidat.append((d_car_bw, c_car_bw, 'car (mundur)'))
+        route_points_local = [user_pt_local]
+        for pid in path_ids:
+            route_points_local.append(pole_by_id[pid]['point_local'])
+        route_points_local.append(fat['point_local'])
 
-        # C. Kalau ada kandidat valid, pilih yang jaraknya PALING PENDEK
-        if kandidat:
-            route_dist, route_coords, profile_used = min(kandidat, key=lambda k: k[0])
-            print(f"BERHASIL! [{profile_used}] Rute Jalan = {round(route_dist, 2)}m")
-            points = [QgsPointXY(pt[0], pt[1]) for pt in route_coords]
-            route_geom = QgsGeometry.fromPolylineXY(points)
-            route_geom.transform(transform_to_local)
-            
-            new_feat = QgsFeature(line_layer.fields())
-            new_feat.setGeometry(route_geom)
-            new_feat.setAttributes([str(selected_user), str(fat['name']), int(fat['idle']), str(fat['olt']), str(fat['koordinat']), float(round(route_dist, 2))])
-            new_features.append(new_feat)
-        else:
-            # TIDAK ADA fallback tarik lurus -- FAT ini dilewati saja
-            print("GAGAL (tidak ada rute jalan/kendaraan yang valid -- dilewati, TIDAK ditarik lurus)")
-        
-        # Jeda 1 detik agar sesuai kebijakan rate-limit server (maks 1 request/detik)
-        time.sleep(1.0)
+        route_geom = QgsGeometry.fromPolylineXY(route_points_local)
+
+        print(f"BERHASIL! [via {len(path_ids)} tiang] Rute = {round(total_dist, 2)}m "
+              f"(drop_user={round(drop_user, 2)}m + jaringan={round(path_dist, 2)}m + drop_fat={round(drop_fat, 2)}m)")
+
+        new_feat = QgsFeature(line_layer.fields())
+        new_feat.setGeometry(route_geom)
+        new_feat.setAttributes([
+            str(selected_user), str(fat['name']), int(fat['idle']), str(fat['olt']),
+            str(fat['koordinat']), float(round(total_dist, 2)), int(len(path_ids))
+        ])
+        new_features.append(new_feat)
 
     # 10. Tampilkan Hasil
     if new_features:
@@ -260,13 +307,13 @@ def run_routing_script_with_search():
         iface.mapCanvas().setExtent(line_layer.extent())
         iface.mapCanvas().refresh()
         
-        QMessageBox.information(parent, "Sukses", f"Ditemukan {len(new_features)} jalur rute valid (mengikuti jalan/jembatan nyata) yang port-nya tersedia.")
+        QMessageBox.information(parent, "Sukses", f"Ditemukan {len(new_features)} jalur rute (mengikuti jaringan tiang) yang port-nya tersedia.")
     else:
         iface.mapCanvas().setCenter(target_user_feat.geometry().asPoint())
         iface.mapCanvas().zoomScale(2000) 
         iface.mapCanvas().refresh()
         
-        QMessageBox.information(parent, "Selesai", "Tidak ada rute jalan/kendaraan yang valid ditemukan dalam radius 500m.")
+        QMessageBox.information(parent, "Selesai", "Tidak ada rute via tiang yang valid ditemukan dalam radius 500m.")
     
     print("--- SELESAI ---")
 
