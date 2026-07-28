@@ -11,10 +11,11 @@ from PyQt5.QtCore import QVariant
 
 def run_routing_script_with_search():
     # ================== KONFIGURASI JARINGAN TIANG ==================
+    # GANTI nama layer tiang ini sesuai nama layer asli di proyekmu
     pole_layer_name = 'tbPole'
-    MAX_SPAN_M = 80         
-    MAX_DROP_M = 500    
-    RADIUS_TIANG_M = 500 
+    RADIUS_TIANG_M = 500  
+    MAX_SPAN_M = 80       
+    MAX_DROP_M = 500      
 
     # 1. Nama layer
     user_layer_name = 'tbUser'
@@ -29,7 +30,7 @@ def run_routing_script_with_search():
         return
 
     if not pole_layers:
-        print(f"Error: Layer tiang '{pole_layer_name}' tidak ditemukan! Ganti nama di variabel pole_layer_name kalau nama layer berbeda.")
+        print(f"Error: Layer tiang '{pole_layer_name}' tidak ditemukan! Ganti nama di variabel pole_layer_name kalau nama layer aslimu berbeda.")
         return
 
     user_layer = user_layers[0]
@@ -103,6 +104,13 @@ def run_routing_script_with_search():
     user_geom_wgs.transform(transform_to_wgs84)
     user_pt_wgs = user_geom_wgs.asPoint()
 
+    # Langsung pan/zoom kanvas ke titik user yang dipilih, SEBELUM proses
+    # pencarian & routing FAT dimulai.
+    iface.mapCanvas().setCenter(user_pt_local)
+    iface.mapCanvas().zoomScale(2000)
+    iface.mapCanvas().refresh()
+    QApplication.processEvents()
+
     # 7. Cache data FAT
     fat_data = []
     for f in fat_layer.getFeatures():
@@ -136,6 +144,12 @@ def run_routing_script_with_search():
             'koordinat': koordinat_teks
         })
 
+    if not fat_data:
+        pesan = f"Tidak ada FAT dengan port tersedia (usedSPLT < 8) di layer '{fat_layer_name}'. Tidak bisa membuat rute untuk '{selected_user}'."
+        print(pesan)
+        QMessageBox.warning(parent, "Tidak Ada FAT", pesan)
+        return
+
     # 7b. Cache data Tiang (hanya yang dalam RADIUS_TIANG_M dari user, biar graf tidak kebesaran)
     print(f"Memuat titik tiang dalam radius {RADIUS_TIANG_M}m dari user...")
     pole_points = []
@@ -164,10 +178,13 @@ def run_routing_script_with_search():
     print(f"-> {len(pole_points)} tiang dimuat.")
 
     if not pole_points:
-        print(f"Tidak ada tiang dalam radius {RADIUS_TIANG_M}m dari user. Tidak bisa membuat rute.")
+        pesan = f"Tidak ada tiang dalam radius {RADIUS_TIANG_M}m dari user '{selected_user}'. Tidak bisa membuat rute."
+        print(pesan)
+        QMessageBox.warning(parent, "Tidak Ada Tiang", pesan)
         return
 
     # 7c. Bangun graf: dua tiang dianggap tersambung (1 bentangan kabel) kalau
+    # jaraknya <= MAX_SPAN_M
     print(f"Membangun graf jaringan tiang (span maks {MAX_SPAN_M}m)...")
     graph = {p['id']: [] for p in pole_points}
     n = len(pole_points)
@@ -313,8 +330,8 @@ def run_routing_script_with_search():
         iface.mapCanvas().zoomScale(2000) 
         iface.mapCanvas().refresh()
         
-        QMessageBox.information(parent, "Selesai", "Tidak ada rute via tiang yang valid ditemukan dalam radius 500m.")
+        QMessageBox.information(parent, "Selesai", "Tidak ada rute FAT via jaringan tiang yang valid ditemukan dalam radius 500m.")
     
-    print("--- SELESAI ---")
+    print("=== SELESAI ===")
 
 run_routing_script_with_search()
