@@ -10,6 +10,7 @@ from PyQt5.QtWidgets import QApplication, QInputDialog, QMessageBox
 from PyQt5.QtCore import QVariant
 
 def run_routing_script_with_search():
+    # ================== KONFIGURASI JARINGAN TIANG =================
     # 1. Nama layer
     user_layer_name = 'tbUser'
     fat_layer_name = 'tbFAT'
@@ -101,8 +102,7 @@ def run_routing_script_with_search():
     user_geom_wgs.transform(transform_to_wgs84)
     user_pt_wgs = user_geom_wgs.asPoint()
 
-    # Langsung pan/zoom kanvas ke titik user yang dipilih, SEBELUM proses
-    # pencarian & routing FAT dimulai.
+    # Langsung pan/zoom kanvas ke titik user yang dipilih, SEBELUM memulai pencarian rute
     iface.mapCanvas().setCenter(user_pt_local)
     iface.mapCanvas().zoomScale(2000)
     iface.mapCanvas().refresh()
@@ -180,42 +180,30 @@ def run_routing_script_with_search():
         QMessageBox.warning(parent, "Tidak Ada Tiang", pesan)
         return
 
-    # 7c. Bangun graf sebagai MINIMUM SPANNING TREE (MST), # agar jalur antar tiang tidak berlebihan (tidak semua tiang terhubung ke semua tiang)
-    print(f"Membangun graf jaringan tiang (span maks {MAX_SPAN_M}m, dipangkas jadi minimum spanning tree)...")
+    # 7c. Bangun graf: setiap tiang dihubungkan ke K TETANGGA TERDEKATnya
+    K_TETANGGA = 5
+    print(f"Membangun graf jaringan tiang (span maks {MAX_SPAN_M}m, {K_TETANGGA} tetangga terdekat/tiang)...")
 
-    class _DSU:
-        """Union-Find sederhana untuk algoritma Kruskal (MST)."""
-        def __init__(self, ids):
-            self.parent = {i: i for i in ids}
-        def find(self, x):
-            while self.parent[x] != x:
-                self.parent[x] = self.parent[self.parent[x]]
-                x = self.parent[x]
-            return x
-        def union(self, a, b):
-            ra, rb = self.find(a), self.find(b)
-            if ra == rb:
-                return False
-            self.parent[ra] = rb
-            return True
-
-    candidate_edges = []
+    graph = {p['id']: [] for p in pole_points}
     n = len(pole_points)
     for i in range(n):
-        for j in range(i + 1, n):
+        dists = []
+        for j in range(n):
+            if i == j:
+                continue
             dist = d_wgs.measureLine(pole_points[i]['point_wgs'], pole_points[j]['point_wgs'])
             if dist <= MAX_SPAN_M:
-                candidate_edges.append((dist, pole_points[i]['id'], pole_points[j]['id']))
+                dists.append((dist, pole_points[j]['id']))
+        dists.sort(key=lambda x: x[0])
 
-    candidate_edges.sort(key=lambda e: e[0])  # Kruskal: proses dari yang terpendek dulu
+        pid = pole_points[i]['id']
+        for dist, neighbor_id in dists[:K_TETANGGA]:
+            if not any(nb == neighbor_id for nb, _ in graph[pid]):
+                graph[pid].append((neighbor_id, dist))
+            if not any(nb == pid for nb, _ in graph[neighbor_id]):
+                graph[neighbor_id].append((pid, dist))
 
-    dsu = _DSU(p['id'] for p in pole_points)
-    graph = {p['id']: [] for p in pole_points}
-    for dist, a, b in candidate_edges:
-        if dsu.union(a, b):  # hanya dipakai kalau benar-benar menyambungkan 2 komponen terpisah
-            graph[a].append((b, dist))
-            graph[b].append((a, dist))
-    print(f"-> Graf (MST, {sum(len(v) for v in graph.values()) // 2} bentangan) selesai dibangun.")
+    print(f"-> Graf ({sum(len(v) for v in graph.values()) // 2} bentangan) selesai dibangun.")
 
     pole_by_id = {p['id']: p for p in pole_points}
 
@@ -278,7 +266,7 @@ def run_routing_script_with_search():
 
     new_features = []
 
-    # 9. Routing lewat jaringan tiang kabel drop (user->tiang & tiang->FAT) dihitung garis lurus
+    # 9. Routing lewat jaringan tiang (bukan lewat OSRM lagi)
     for fat in fat_data:
         straight_dist = d_wgs.measureLine(user_pt_wgs, fat['point_wgs'])
         
@@ -351,7 +339,7 @@ def run_routing_script_with_search():
         iface.mapCanvas().zoomScale(2000) 
         iface.mapCanvas().refresh()
         
-        QMessageBox.information(parent, "Selesai", "Tidak ada rute FAT via tiang yang ditemukan dalam radius 500m.")
+        QMessageBox.information(parent, "Selesai", "Tidak ada rute FAT via jaringan tiang dalam radius 500m.")
     
     print("=== END ===")
 
