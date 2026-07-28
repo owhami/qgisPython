@@ -13,7 +13,7 @@ def run_routing_script_with_search():
     # 1. Nama layer
     user_layer_name = 'tbUser'
     fat_layer_name = 'tbFAT'
-    pole_layer_name = 'tbTiang'
+    pole_layer_name = 'tbPole'
 
     RADIUS_TIANG_M = 500  # hanya tiang dalam radius ini dari user yang dimuat ke graf (performa)
     MAX_SPAN_M = 80       # jarak maksimal antar tiang yang dianggap 1 bentangan kabel
