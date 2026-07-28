@@ -2,7 +2,7 @@ import heapq
 from qgis.core import (
     QgsProject, QgsFeature, QgsGeometry, QgsVectorLayer,
     QgsDistanceArea, QgsField, QgsCoordinateTransform, 
-    QgsCoordinateReferenceSystem, QgsPointXY,
+    QgsCoordinateReferenceSystem,
     QgsSimpleLineSymbolLayer, QgsLineSymbol, QgsSingleSymbolRenderer
 )
 from qgis.utils import iface
@@ -10,17 +10,14 @@ from PyQt5.QtWidgets import QApplication, QInputDialog, QMessageBox
 from PyQt5.QtCore import QVariant
 
 def run_routing_script_with_search():
-        
-
     # 1. Nama layer
     user_layer_name = 'tbUser'
     fat_layer_name = 'tbFAT'
-    pole_layer_name = 'tbPole'
+    pole_layer_name = 'tbTiang'
 
-    # ================== KONFIGURASI JARINGAN TIANG ==================
-    RADIUS_TIANG_M = 500  
-    MAX_SPAN_M = 80       
-    MAX_DROP_M = 500  
+    RADIUS_TIANG_M = 500  # hanya tiang dalam radius ini dari user yang dimuat ke graf (performa)
+    MAX_SPAN_M = 80       # jarak maksimal antar tiang yang dianggap 1 bentangan kabel
+    MAX_DROP_M = 500      # jarak maksimal dari user/FAT ke tiang terdekat (kabel drop)
 
     user_layers = QgsProject.instance().mapLayersByName(user_layer_name)
     fat_layers = QgsProject.instance().mapLayersByName(fat_layer_name)
@@ -91,7 +88,6 @@ def run_routing_script_with_search():
     # 5. Transformasi CRS ke EPSG:4326
     crs_wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
     transform_to_wgs84 = QgsCoordinateTransform(user_layer.crs(), crs_wgs84, QgsProject.instance())
-    transform_to_local = QgsCoordinateTransform(crs_wgs84, user_layer.crs(), QgsProject.instance())
 
     d_wgs = QgsDistanceArea()
     d_wgs.setSourceCrs(crs_wgs84, QgsProject.instance().transformContext())
@@ -184,20 +180,45 @@ def run_routing_script_with_search():
         QMessageBox.warning(parent, "Tidak Ada Tiang", pesan)
         return
 
-    # 7c. Bangun graf: dua tiang dianggap tersambung (1 bentangan kabel) kalau
-    # jaraknya <= MAX_SPAN_M
-    print(f"Membangun graf jaringan tiang (span maks {MAX_SPAN_M}m)...")
-    graph = {p['id']: [] for p in pole_points}
+    # 7c. Bangun graf sebagai MINIMUM SPANNING TREE (MST), # agar jalur antar tiang tidak berlebihan (tidak semua tiang terhubung ke semua tiang)
+    print(f"Membangun graf jaringan tiang (span maks {MAX_SPAN_M}m, dipangkas jadi minimum spanning tree)...")
+
+    class _DSU:
+        """Union-Find sederhana untuk algoritma Kruskal (MST)."""
+        def __init__(self, ids):
+            self.parent = {i: i for i in ids}
+        def find(self, x):
+            while self.parent[x] != x:
+                self.parent[x] = self.parent[self.parent[x]]
+                x = self.parent[x]
+            return x
+        def union(self, a, b):
+            ra, rb = self.find(a), self.find(b)
+            if ra == rb:
+                return False
+            self.parent[ra] = rb
+            return True
+
+    candidate_edges = []
     n = len(pole_points)
     for i in range(n):
         for j in range(i + 1, n):
             dist = d_wgs.measureLine(pole_points[i]['point_wgs'], pole_points[j]['point_wgs'])
             if dist <= MAX_SPAN_M:
-                graph[pole_points[i]['id']].append((pole_points[j]['id'], dist))
-                graph[pole_points[j]['id']].append((pole_points[i]['id'], dist))
-    print("-> Graf selesai dibangun.")
+                candidate_edges.append((dist, pole_points[i]['id'], pole_points[j]['id']))
+
+    candidate_edges.sort(key=lambda e: e[0])  # Kruskal: proses dari yang terpendek dulu
+
+    dsu = _DSU(p['id'] for p in pole_points)
+    graph = {p['id']: [] for p in pole_points}
+    for dist, a, b in candidate_edges:
+        if dsu.union(a, b):  # hanya dipakai kalau benar-benar menyambungkan 2 komponen terpisah
+            graph[a].append((b, dist))
+            graph[b].append((a, dist))
+    print(f"-> Graf (MST, {sum(len(v) for v in graph.values()) // 2} bentangan) selesai dibangun.")
 
     pole_by_id = {p['id']: p for p in pole_points}
+
 
     def dijkstra(start_id, end_id):
         """Cari jalur terpendek antar dua tiang di graf.
@@ -257,9 +278,7 @@ def run_routing_script_with_search():
 
     new_features = []
 
-    # 9. Routing lewat jaringan tiang (bukan lewat OSRM lagi) -- kabel drop
-    # (user->tiang & tiang->FAT) dihitung garis lurus (sesuai praktik FTTH
-    # nyata), jalur antar tiang dicari lewat Dijkstra di graf yang sudah dibangun.
+    # 9. Routing lewat jaringan tiang kabel drop (user->tiang & tiang->FAT) dihitung garis lurus
     for fat in fat_data:
         straight_dist = d_wgs.measureLine(user_pt_wgs, fat['point_wgs'])
         
@@ -294,7 +313,8 @@ def run_routing_script_with_search():
         route_geom = QgsGeometry.fromPolylineXY(route_points_local)
 
         print(f"BERHASIL! [via {len(path_ids)} tiang] Rute = {round(total_dist, 2)}m "
-              f"(drop_user={round(drop_user, 2)}m + jaringan={round(path_dist, 2)}m + drop_fat={round(drop_fat, 2)}m)")
+              f"(drop_user={round(drop_user, 2)}m + jaringan={round(path_dist, 2)}m + drop_fat={round(drop_fat, 2)}m) "
+              f"-- lewat: {' -> '.join(pole_by_id[pid]['label'] for pid in path_ids)}")
 
         new_feat = QgsFeature(line_layer.fields())
         new_feat.setGeometry(route_geom)
@@ -331,8 +351,8 @@ def run_routing_script_with_search():
         iface.mapCanvas().zoomScale(2000) 
         iface.mapCanvas().refresh()
         
-        QMessageBox.information(parent, "Selesai", "Tidak ada rute FAT via jaringan tiang yang valid ditemukan dalam radius 500m.")
+        QMessageBox.information(parent, "Selesai", "Tidak ada rute FAT via tiang yang ditemukan dalam radius 500m.")
     
-    print("=== SELESAI ===")
+    print("=== END ===")
 
 run_routing_script_with_search()
