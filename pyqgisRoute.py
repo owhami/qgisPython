@@ -1,139 +1,278 @@
 import heapq
+import os
 from qgis.core import (
     QgsProject, QgsFeature, QgsGeometry, QgsVectorLayer,
-    QgsDistanceArea, QgsField, QgsCoordinateTransform, 
-    QgsCoordinateReferenceSystem,
-    QgsSimpleLineSymbolLayer, QgsLineSymbol, QgsSingleSymbolRenderer
+    QgsDistanceArea, QgsField, QgsCoordinateTransform,
+    QgsCoordinateReferenceSystem, QgsPointXY, QgsApplication,
+    QgsSimpleLineSymbolLayer, QgsLineSymbol, QgsSingleSymbolRenderer,
+    QgsMarkerSymbol, QgsSvgMarkerSymbolLayer,
+    QgsPalLayerSettings, QgsTextFormat, QgsVectorLayerSimpleLabeling
 )
 from qgis.utils import iface
 from PyQt5.QtWidgets import QApplication, QInputDialog, QMessageBox
 from PyQt5.QtCore import QVariant
 
+
+def _cari_svg_camp():
+    """Cari file SVG bawaan QGIS yang namanya mengandung kata 'camp'
+    (mis. simbol tenda/perkemahan di library topo). Return path lengkap
+    kalau ketemu, atau None kalau tidak ada di instalasi QGIS ini."""
+    try:
+        svg_paths = QgsApplication.svgPaths()
+    except Exception:
+        return None
+
+    kandidat = []
+    for base in svg_paths:
+        if not base or not os.path.isdir(base):
+            continue
+        for root, _dirs, files in os.walk(base):
+            for fn in files:
+                if fn.lower().endswith('.svg') and 'camp' in fn.lower():
+                    kandidat.append(os.path.join(root, fn))
+
+    if not kandidat:
+        return None
+
+    # Prioritaskan yang paling mendekati nama "camp" murni (bukan turunan lain)
+    kandidat.sort(key=lambda p: len(os.path.basename(p)))
+    return kandidat[0]
+
+
 def run_routing_script_with_search():
     # ================== KONFIGURASI JARINGAN TIANG =================
-    # 1. Nama layer
     user_layer_name = 'tbUser'
     fat_layer_name = 'tbFAT'
     pole_layer_name = 'tbPole'
 
-    RADIUS_TIANG_M = 500  # hanya tiang dalam radius ini dari user yang dimuat ke graf (performa)
-    MAX_SPAN_M = 80       # jarak maksimal antar tiang yang dianggap 1 bentangan kabel
-    MAX_DROP_M = 500      # jarak maksimal dari user/FAT ke tiang terdekat (kabel drop)
+    RADIUS_TIANG_M = 500   # hanya tiang dalam radius ini dari user yang dimuat ke graf (performa)
+    MAX_SPAN_M = 80        # jarak maksimal antar tiang yang dianggap 1 bentangan kabel
+    MAX_DROP_M = 500       # jarak maksimal dari user/FAT ke tiang terdekat (kabel drop)
+    K_TETANGGA = 5         # jumlah tetangga terdekat per tiang saat membangun graf
 
-    user_layers = QgsProject.instance().mapLayersByName(user_layer_name)
+    parent = iface.mainWindow() if iface else None
+    crs_wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
+
+    # ---------- 1. Layer wajib (dibutuhkan di kedua mode): FAT & Tiang ----------
     fat_layers = QgsProject.instance().mapLayersByName(fat_layer_name)
     pole_layers = QgsProject.instance().mapLayersByName(pole_layer_name)
 
-    if not user_layers or not fat_layers:
-        print("Error: Layer tbUser atau tbFAT tidak ditemukan!")
+    if not fat_layers:
+        QMessageBox.critical(parent, "Error", f"Layer '{fat_layer_name}' tidak ditemukan!")
         return
-
     if not pole_layers:
-        print(f"Error: Layer tiang '{pole_layer_name}' tidak ditemukan! Ganti nama di variabel pole_layer_name kalau nama layer aslimu berbeda.")
+        QMessageBox.critical(
+            parent, "Error",
+            f"Layer tiang '{pole_layer_name}' tidak ditemukan! "
+            "Ganti nama di variabel pole_layer_name kalau nama layer aslimu berbeda."
+        )
         return
 
-    user_layer = user_layers[0]
     fat_layer = fat_layers[0]
     pole_layer = pole_layers[0]
 
-    # 2. Daftar userPaniki
-    daftar_user = []
-    user_dict = {} 
-    
-    for f in user_layer.getFeatures():
-        if not f.hasGeometry() or f.geometry().isNull():
-            continue
-        
-        raw_name = f['userPaniki'] if 'userPaniki' in f.fields().names() else f.id()
-        nama_user = str(raw_name).strip() if raw_name else str(f.id())
-        
-        if nama_user not in daftar_user:
-            daftar_user.append(nama_user)
-            user_dict[nama_user] = f
-
-    if not daftar_user:
-        print("Tidak ada data user valid di layer tbUser.")
-        return
-
-    # 3. Pop-up Search User
-    parent = iface.mainWindow() if iface else None
-    search_text, ok = QInputDialog.getText(
-        parent, 
-        "Cari User PANIKI", 
-        "Ketik userPaniki (atau sebagian namanya):"
+    # ---------- 2. Popup validasi: apakah tbUser tersedia? ----------
+    jawaban = QMessageBox.question(
+        parent,
+        "Validasi Layer tbUser",
+        "Apakah layer 'tbUser' tersedia di project ini?\n\n"
+        "• Pilih 'Yes' untuk mencari user dari tabel tbUser (isi nama userPaniki).\n"
+        "• Pilih 'No' untuk memasukkan titik koordinat user secara manual.",
+        QMessageBox.Yes | QMessageBox.No
     )
+    mode_manual = (jawaban == QMessageBox.No)
 
-    if not ok or not search_text.strip():
-        print("Pencarian dibatalkan.")
-        return
+    # CRS lokal acuan project. Default pakai CRS layer tiang (selalu ada di kedua mode).
+    local_crs = pole_layer.crs()
 
-    # 4. Logika Filter Teks
-    search_query = search_text.strip().lower()
-    matched_users = [name for name in daftar_user if search_query in name.lower()]
+    selected_user = None
+    user_pt_local = None
+    user_pt_wgs = None
 
-    if len(matched_users) == 0:
-        QMessageBox.warning(parent, "Pencarian Gagal", f"Tidak menemukan user yang mengandung kata '{search_text}'.")
-        return
-    elif len(matched_users) == 1:
-        selected_user = matched_users[0]
-    else:
-        matched_users.sort()
-        selected_user, ok_combo = QInputDialog.getItem(
-            parent, "Pilih User Spesifik", f"Ditemukan {len(matched_users)} nama yang mirip:", matched_users, 0, False
-        )
-        if not ok_combo or not selected_user:
+    if not mode_manual:
+        # ================= MODE A: CARI USER DARI tbUser (alur lama) =================
+        user_layers = QgsProject.instance().mapLayersByName(user_layer_name)
+        if not user_layers:
+            QMessageBox.warning(
+                parent, "Layer Tidak Ditemukan",
+                f"Layer '{user_layer_name}' tidak ditemukan di project.\n"
+                "Jalankan ulang script lalu pilih 'No' untuk input koordinat manual."
+            )
             return
+
+        user_layer = user_layers[0]
+        local_crs = user_layer.crs()  # pakai CRS layer user sebagai acuan, sesuai perilaku asli
+
+        # Daftar userPaniki
+        daftar_user = []
+        user_dict = {}
+        for f in user_layer.getFeatures():
+            if not f.hasGeometry() or f.geometry().isNull():
+                continue
+            raw_name = f['userPaniki'] if 'userPaniki' in f.fields().names() else f.id()
+            nama_user = str(raw_name).strip() if raw_name else str(f.id())
+            if nama_user not in daftar_user:
+                daftar_user.append(nama_user)
+                user_dict[nama_user] = f
+
+        if not daftar_user:
+            print("Tidak ada data user valid di layer tbUser.")
+            return
+
+        # Pop-up Search User
+        search_text, ok = QInputDialog.getText(
+            parent, "Cari User PANIKI", "Ketik userPaniki (atau sebagian namanya):"
+        )
+        if not ok or not search_text.strip():
+            print("Pencarian dibatalkan.")
+            return
+
+        search_query = search_text.strip().lower()
+        matched_users = [name for name in daftar_user if search_query in name.lower()]
+
+        if len(matched_users) == 0:
+            QMessageBox.warning(parent, "Pencarian Gagal", f"Tidak menemukan user yang mengandung kata '{search_text}'.")
+            return
+        elif len(matched_users) == 1:
+            selected_user = matched_users[0]
+        else:
+            matched_users.sort()
+            selected_user, ok_combo = QInputDialog.getItem(
+                parent, "Pilih User Spesifik", f"Ditemukan {len(matched_users)} nama yang mirip:", matched_users, 0, False
+            )
+            if not ok_combo or not selected_user:
+                return
+
+        target_user_feat = user_dict[selected_user]
+        user_pt_local = target_user_feat.geometry().asPoint()
+
+        transform_to_wgs84_user = QgsCoordinateTransform(local_crs, crs_wgs84, QgsProject.instance())
+        user_geom_wgs = QgsGeometry(target_user_feat.geometry())
+        user_geom_wgs.transform(transform_to_wgs84_user)
+        user_pt_wgs = user_geom_wgs.asPoint()
+
+    else:
+        # ================= MODE B: INPUT KOORDINAT MANUAL =================
+        coord_text, ok = QInputDialog.getText(
+            parent,
+            "Input Koordinat User",
+            "Layer tbUser tidak digunakan.\n"
+            "Masukkan koordinat titik user (format: latitude, longitude)\n"
+            "Contoh: 1.487523, 124.845123"
+        )
+        if not ok or not coord_text.strip():
+            print("Input koordinat dibatalkan.")
+            return
+
+        try:
+            lat_str, lon_str = coord_text.strip().split(',')
+            lat = float(lat_str.strip())
+            lon = float(lon_str.strip())
+        except (ValueError, AttributeError):
+            QMessageBox.warning(
+                parent, "Format Salah",
+                "Format koordinat tidak valid. Gunakan format: latitude, longitude\nContoh: 1.487523, 124.845123"
+            )
+            return
+
+        nama_input, ok2 = QInputDialog.getText(
+            parent, "Nama/Label User", "Masukkan nama atau label untuk titik ini (boleh dikosongkan):"
+        )
+        selected_user = nama_input.strip() if (ok2 and nama_input.strip()) else f"Titik_{lat:.6f}_{lon:.6f}"
+
+        user_pt_wgs = QgsPointXY(lon, lat)  # QGIS: x = longitude, y = latitude
+
+        transform_from_wgs84 = QgsCoordinateTransform(crs_wgs84, local_crs, QgsProject.instance())
+        user_geom_local = QgsGeometry.fromPointXY(user_pt_wgs)
+        user_geom_local.transform(transform_from_wgs84)
+        user_pt_local = user_geom_local.asPoint()
 
     print(f"\n--- MEMULAI PENCARIAN UNTUK: {selected_user} ---")
 
-    # 5. Transformasi CRS ke EPSG:4326
-    crs_wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
-    transform_to_wgs84 = QgsCoordinateTransform(user_layer.crs(), crs_wgs84, QgsProject.instance())
-
+    # ---------- 3. Alat ukur jarak & transform (dipakai bersama kedua mode) ----------
     d_wgs = QgsDistanceArea()
     d_wgs.setSourceCrs(crs_wgs84, QgsProject.instance().transformContext())
     d_wgs.setEllipsoid('WGS84')
 
-    # 6. Ekstrak data User
-    target_user_feat = user_dict[selected_user]
-    user_pt_local = target_user_feat.geometry().asPoint()
-    
-    user_geom_wgs = QgsGeometry(target_user_feat.geometry())
-    user_geom_wgs.transform(transform_to_wgs84)
-    user_pt_wgs = user_geom_wgs.asPoint()
+    transform_to_wgs84 = QgsCoordinateTransform(local_crs, crs_wgs84, QgsProject.instance())
 
-    # Langsung pan/zoom kanvas ke titik user yang dipilih, SEBELUM memulai pencarian rute
+    # Pan/zoom kanvas ke titik user SEBELUM proses pencarian & routing FAT dimulai.
     iface.mapCanvas().setCenter(user_pt_local)
     iface.mapCanvas().zoomScale(2000)
     iface.mapCanvas().refresh()
     QApplication.processEvents()
 
-    # 7. Cache data FAT
+    # ---------- 3b. Tandai titik user dengan simbol "topo camp" ----------
+    # Hanya dibuat kalau user TIDAK punya tbUser (mode input koordinat manual).
+    if mode_manual:
+        user_marker_layer = QgsVectorLayer(f"Point?crs={local_crs.authid()}", f"Titik_Manual_{selected_user}", "memory")
+        marker_provider = user_marker_layer.dataProvider()
+        marker_provider.addAttributes([QgsField("nama_user", QVariant.String)])
+        user_marker_layer.updateFields()
+
+        marker_feat = QgsFeature(user_marker_layer.fields())
+        marker_feat.setGeometry(QgsGeometry.fromPointXY(user_pt_local))
+        marker_feat.setAttributes([str(selected_user)])
+
+        user_marker_layer.startEditing()
+        user_marker_layer.addFeature(marker_feat)
+        user_marker_layer.commitChanges()
+        user_marker_layer.updateExtents()
+
+        camp_svg_path = _cari_svg_camp()
+        if camp_svg_path:
+            svg_symbol_layer = QgsSvgMarkerSymbolLayer(camp_svg_path)
+            svg_symbol_layer.setSize(8)
+            marker_symbol = QgsMarkerSymbol()
+            marker_symbol.changeSymbolLayer(0, svg_symbol_layer)
+            print(f"Simbol 'camp' ditemukan: {camp_svg_path}")
+        else:
+            # Fallback kalau tidak ada SVG 'camp' di instalasi QGIS ini
+            marker_symbol = QgsMarkerSymbol.createSimple({
+                'name': 'star',
+                'color': '255,140,0,255',
+                'size': '8'
+            })
+            print("Peringatan: SVG simbol 'camp' tidak ditemukan di library QGIS, memakai simbol bintang oranye sebagai gantinya.")
+
+        # Beri label kecil di titik supaya nama/labelnya terbaca di kanvas
+        label_settings = QgsPalLayerSettings()
+        label_settings.fieldName = "nama_user"
+        text_format = QgsTextFormat()
+        text_format.setSize(9)
+        label_settings.setFormat(text_format)
+        user_marker_layer.setLabeling(QgsVectorLayerSimpleLabeling(label_settings))
+        user_marker_layer.setLabelsEnabled(True)
+
+        user_marker_layer.setRenderer(QgsSingleSymbolRenderer(marker_symbol))
+        QgsProject.instance().addMapLayer(user_marker_layer)
+
+    # ---------- 4. Cache data FAT ----------
     fat_data = []
     for f in fat_layer.getFeatures():
         if not f.hasGeometry():
             continue
-            
+
         try:
             idle_val = int(f['usedSPLT'])
         except (ValueError, TypeError, KeyError):
             idle_val = 8
-            
+
         if idle_val >= 8:
             continue
-        
+
         fat_pt_local = f.geometry().asPoint()
-        
+
         fat_geom_wgs = QgsGeometry(f.geometry())
         fat_geom_wgs.transform(transform_to_wgs84)
         fat_pt_wgs = fat_geom_wgs.asPoint()
-        
+
         idFAT = f['idFAT'] if 'idFAT' in f.fields().names() else str(f.id())
         nama_olt = str(f['idOLT']) if 'idOLT' in f.fields().names() else "-"
         koordinat_teks = f"{fat_pt_wgs.y():.6f}, {fat_pt_wgs.x():.6f}"
-        
+
         fat_data.append({
-            'name': idFAT, 
+            'name': idFAT,
             'point_wgs': fat_pt_wgs,
             'point_local': fat_pt_local,
             'idle': idle_val,
@@ -147,7 +286,7 @@ def run_routing_script_with_search():
         QMessageBox.warning(parent, "Tidak Ada FAT", pesan)
         return
 
-    # 7b. Cache data Tiang (hanya yang dalam RADIUS_TIANG_M dari user, biar graf tidak kebesaran)
+    # ---------- 5. Cache data Tiang (hanya dalam RADIUS_TIANG_M dari user) ----------
     print(f"Memuat titik tiang dalam radius {RADIUS_TIANG_M}m dari user...")
     pole_points = []
     for i, f in enumerate(pole_layer.getFeatures()):
@@ -180,8 +319,7 @@ def run_routing_script_with_search():
         QMessageBox.warning(parent, "Tidak Ada Tiang", pesan)
         return
 
-    # 7c. Bangun graf: setiap tiang dihubungkan ke K TETANGGA TERDEKATnya
-    K_TETANGGA = 5
+    # ---------- 6. Bangun graf: tiap tiang terhubung ke K tetangga terdekatnya ----------
     print(f"Membangun graf jaringan tiang (span maks {MAX_SPAN_M}m, {K_TETANGGA} tetangga terdekat/tiang)...")
 
     graph = {p['id']: [] for p in pole_points}
@@ -206,7 +344,6 @@ def run_routing_script_with_search():
     print(f"-> Graf ({sum(len(v) for v in graph.values()) // 2} bentangan) selesai dibangun.")
 
     pole_by_id = {p['id']: p for p in pole_points}
-
 
     def dijkstra(start_id, end_id):
         """Cari jalur terpendek antar dua tiang di graf.
@@ -248,11 +385,11 @@ def run_routing_script_with_search():
                 best_dist = dist
         return best, best_dist
 
-    # 8. Layer Output
+    # ---------- 7. Layer Output ----------
     layer_name = f"Rute_{selected_user}_Tiang"
-    line_layer = QgsVectorLayer(f"LineString?crs={user_layer.crs().authid()}", layer_name, "memory")
+    line_layer = QgsVectorLayer(f"LineString?crs={local_crs.authid()}", layer_name, "memory")
     provider = line_layer.dataProvider()
-    
+
     provider.addAttributes([
         QgsField("userPaniki", QVariant.String),
         QgsField("idFAT", QVariant.String),
@@ -266,10 +403,10 @@ def run_routing_script_with_search():
 
     new_features = []
 
-    # 9. Routing lewat jaringan tiang (bukan lewat OSRM lagi)
+    # ---------- 8. Routing lewat jaringan tiang untuk tiap FAT ----------
     for fat in fat_data:
         straight_dist = d_wgs.measureLine(user_pt_wgs, fat['point_wgs'])
-        
+
         if straight_dist > 500:
             continue
 
@@ -312,35 +449,36 @@ def run_routing_script_with_search():
         ])
         new_features.append(new_feat)
 
-    # 10. Tampilkan Hasil
+    # ---------- 9. Tampilkan Hasil ----------
     if new_features:
         line_layer.startEditing()
         line_layer.addFeatures(new_features)
         line_layer.commitChanges()
         line_layer.updateExtents()
-        
+
         symbol_layer = QgsSimpleLineSymbolLayer.create({
-            'line_width': '0.8',          
-            'line_color': '255,0,0,255'   
+            'line_width': '0.8',
+            'line_color': '255,0,0,255'
         })
-        
+
         symbol = QgsLineSymbol([symbol_layer])
         renderer = QgsSingleSymbolRenderer(symbol)
         line_layer.setRenderer(renderer)
-        
+
         QgsProject.instance().addMapLayer(line_layer)
-        
+
         iface.mapCanvas().setExtent(line_layer.extent())
         iface.mapCanvas().refresh()
-        
+
         QMessageBox.information(parent, "Sukses", f"Ditemukan {len(new_features)} jalur rute (mengikuti jaringan tiang) yang port-nya tersedia.")
     else:
-        iface.mapCanvas().setCenter(target_user_feat.geometry().asPoint())
-        iface.mapCanvas().zoomScale(2000) 
+        iface.mapCanvas().setCenter(user_pt_local)
+        iface.mapCanvas().zoomScale(2000)
         iface.mapCanvas().refresh()
-        
+
         QMessageBox.information(parent, "Selesai", "Tidak ada rute FAT via jaringan tiang dalam radius 500m.")
-    
+
     print("=== END ===")
+
 
 run_routing_script_with_search()
