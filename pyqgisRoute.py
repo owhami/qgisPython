@@ -12,7 +12,6 @@ from qgis.utils import iface
 from PyQt5.QtWidgets import QApplication, QInputDialog, QMessageBox
 from PyQt5.QtCore import QVariant
 
-
 def _cari_svg_camp():
     """Cari file SVG bawaan QGIS yang namanya mengandung kata 'camp'
     (mis. simbol tenda/perkemahan di library topo). Return path lengkap
@@ -37,7 +36,6 @@ def _cari_svg_camp():
     # Prioritaskan yang paling mendekati nama "camp" murni (bukan turunan lain)
     kandidat.sort(key=lambda p: len(os.path.basename(p)))
     return kandidat[0]
-
 
 def run_routing_script_with_search():
     # ================== KONFIGURASI JARINGAN TIANG =================
@@ -222,7 +220,7 @@ def run_routing_script_with_search():
         camp_svg_path = _cari_svg_camp()
         if camp_svg_path:
             svg_symbol_layer = QgsSvgMarkerSymbolLayer(camp_svg_path)
-            svg_symbol_layer.setSize(8)
+            svg_symbol_layer.setSize(12)
             marker_symbol = QgsMarkerSymbol()
             marker_symbol.changeSymbolLayer(0, svg_symbol_layer)
             print(f"Simbol 'camp' ditemukan: {camp_svg_path}")
@@ -231,7 +229,7 @@ def run_routing_script_with_search():
             marker_symbol = QgsMarkerSymbol.createSimple({
                 'name': 'star',
                 'color': '255,140,0,255',
-                'size': '8'
+                'size': '12'
             })
             print("Peringatan: SVG simbol 'camp' tidak ditemukan di library QGIS, memakai simbol bintang oranye sebagai gantinya.")
 
@@ -479,6 +477,5 @@ def run_routing_script_with_search():
         QMessageBox.information(parent, "Selesai", "Tidak ada rute FAT via jaringan tiang dalam radius 500m.")
 
     print("=== END ===")
-
 
 run_routing_script_with_search()
